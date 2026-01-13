@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	diskMinMB     = 30000
+	diskMinMB     = 40000
 	netMinMbit    = 300
 	memMaxPercent = 90
 	loadMax       = 40
