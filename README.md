@@ -28,3 +28,4 @@ git fetch template && git checkout template/main .github
 Автотесты запускаются на любой коммит в репозиторий.
 
 Подробнее про локальный и автоматический запуск читайте в [README автотестов](https://github.com/Yandex-Practicum/go-autotests).
+test
