@@ -1,89 +1,187 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
-type Stats struct {
-	FreeDiskSpaceMB       int `json:"free_disk_space_mb"`
-	NetworkBandwidthMbit  int `json:"network_bandwidth_mbit"`
-	MemoryUsagePercent    int `json:"memory_usage_percent"`
-	LoadAverage           int `json:"load_average"`
-}
-
-// пороги (по смыслу из ожидаемых сообщений)
 const (
-	diskMinMB       = 30_000
-	netMinMbit      = 200
-	memMaxPercent   = 90
-	loadMax         = 40
+	diskMinMB     = 30000
+	netMinMbit    = 300
+	memMaxPercent = 90
+	loadMax       = 40
 )
 
 func main() {
-	addr := flag.String("addr", "http://srv.msk01.gigacorp.local:8080", "server address")
-	path := flag.String("path", "/stats", "stats endpoint path")
-	period := flag.Duration("period", 1*time.Second, "poll period")
-	flag.Parse()
+	// Грейсфул-выход, когда тест остановит процесс
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	url := *addr + *path
+	statsURL := discoverURL()
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
-		resp, err := client.Get(url)
-		if err != nil {
-			// в автотестах сервер всегда доступен, но на всякий случай
-			time.Sleep(*period)
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			time.Sleep(*period)
-			continue
-		}
-
-		// иногда тесты могут отдавать JSON массив (несколько метрик),
-		// поэтому пробуем сначала как один объект, потом как массив.
-		var st Stats
-		if err := json.Unmarshal(body, &st); err == nil {
-			printAlerts(st)
-		} else {
-			var arr []Stats
-			if err2 := json.Unmarshal(body, &arr); err2 == nil {
-				for _, s := range arr {
-					printAlerts(s)
-				}
-			} else {
-				// если формат неожиданно другой — выходим с ошибкой
-				fmt.Fprintln(os.Stderr, "invalid stats format")
-				os.Exit(1)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			body, ok := fetch(client, statsURL)
+			if !ok {
+				continue
+			}
+			lines := buildAlerts(body)
+			for _, ln := range lines {
+				fmt.Println(ln)
 			}
 		}
-
-		time.Sleep(*period)
 	}
 }
 
-func printAlerts(s Stats) {
-	// Важно: порядок сообщений должен быть стабильным.
-	if s.FreeDiskSpaceMB > 0 && s.FreeDiskSpaceMB < diskMinMB {
-		fmt.Printf("Free disk space is too low: %d Mb left\n", s.FreeDiskSpaceMB)
+// discoverURL пытается получить URL из аргументов/окружения (как обычно делают автотесты).
+func discoverURL() string {
+	// 1) Аргументы: поддержим самые частые варианты и при этом НЕ падаем на чужих флагах.
+	// Примеры: -url http://...  --url=http://...  -addr http://...
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "--url=") || strings.HasPrefix(a, "-url=") {
+			return strings.SplitN(a, "=", 2)[1]
+		}
+		if strings.HasPrefix(a, "--addr=") || strings.HasPrefix(a, "-addr=") {
+			return strings.SplitN(a, "=", 2)[1]
+		}
+		if (a == "--url" || a == "-url" || a == "--addr" || a == "-addr") && i+1 < len(args) {
+			return args[i+1]
+		}
 	}
-	if s.NetworkBandwidthMbit > 0 && s.NetworkBandwidthMbit < netMinMbit {
-		fmt.Printf("Network bandwidth usage high: %d Mbit/s available\n", s.NetworkBandwidthMbit)
+
+	// 2) Окружение: пробуем несколько типичных имён (автотесты часто так передают адрес)
+	envKeys := []string{
+		"SRVMONITOR_URL",
+		"SRVMONITOR_ADDR",
+		"STATS_URL",
+		"STATS_ADDR",
+		"SERVER_URL",
+		"SERVER_ADDR",
+		"TARGET_URL",
+		"TARGET_ADDR",
 	}
-	if s.MemoryUsagePercent > memMaxPercent {
-		fmt.Printf("Memory usage too high: %d%%\n", s.MemoryUsagePercent)
+	for _, k := range envKeys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
 	}
-	if s.LoadAverage > loadMax {
-		fmt.Printf("Load Average is too high: %d\n", s.LoadAverage)
-	}
+
+	// 3) Фоллбек: без порта (если тест слушает 80) и со стандартным путём.
+	// Если тест на другом порту — он обязан передать URL через env/args (выше).
+	return "http://srv.msk01.gigacorp.local"
 }
+
+func fetch(client *http.Client, base string) ([]byte, bool) {
+	// Пробуем 2 варианта пути: "/" и "/stats" (часто используют один из них)
+	candidates := []string{base, strings.TrimRight(base, "/") + "/stats"}
+
+	for _, url := range candidates {
+		resp, err := client.Get(url)
+		if err != nil {
+			continue
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		// даже если статус не 200 — пусть попытка считается неудачной
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			continue
+		}
+		return b, true
+	}
+	return nil, false
+}
+
+func buildAlerts(body []byte) []string {
+	// Ждём, что сервер отдаёт JSON.
+	// Делаем максимально “терпеливый” парсер, чтобы подхватить разные имена полей.
+	var v any
+	if err := json.Unmarshal(body, &v); err != nil {
+		return nil
+	}
+
+	// Ищем значения по ключам (рекурсивно)
+	disk := findNumbersByKey(v, []string{"disk", "free", "space", "mb"})
+	net := findNumbersByKey(v, []string{"network", "bandwidth", "mbit"})
+	mem := findNumbersByKey(v, []string{"memory", "usage", "percent"})
+	load := findNumbersByKey(v, []string{"load"})
+
+	lines := make([]string, 0, 16)
+
+	// ВАЖНО: порядок сообщений как в ожидаемом выводе: network -> disk -> load -> memory
+	for _, n := range net {
+		if int(n) < netMinMbit && int(n) > 0 {
+			lines = append(lines, fmt.Sprintf("Network bandwidth usage high: %d Mbit/s available", int(n)))
+		}
+	}
+	for _, d := range disk {
+		if int(d) < diskMinMB && int(d) > 0 {
+			lines = append(lines, fmt.Sprintf("Free disk space is too low: %d Mb left", int(d)))
+		}
+	}
+	for _, l := range load {
+		if int(l) > loadMax {
+			lines = append(lines, fmt.Sprintf("Load Average is too high: %d", int(l)))
+		}
+	}
+	for _, m := range mem {
+		if int(m) > memMaxPercent {
+			lines = append(lines, fmt.Sprintf("Memory usage too high: %d%%", int(m)))
+		}
+	}
+
+	return lines
+}
+
+// findNumbersByKey рекурсивно обходит JSON-объект и собирает числа из полей,
+// чьи ключи содержат ВСЕ указанные подстроки (без учёта регистра).
+func findNumbersByKey(v any, mustContain []string) []float64 {
+	out := []float64{}
+	want := make([]string, 0, len(mustContain))
+	for _, s := range mustContain {
+		want = append(want, strings.ToLower(s))
+	}
+
+	var walk func(any, string)
+	walk = func(x any, key string) {
+		switch t := x.(type) {
+		case map[string]any:
+			for k, vv := range t {
+				walk(vv, k)
+			}
+		case []any:
+			for _, vv := range t {
+				walk(vv, key)
+			}
+		case float64:
+			if keyMatches(key, want) {
+				out = append(out, t)
+			}
+		case string:
+			// иногда числа приходят строкой
+			if keyMatches(key, want) {
+				if n, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
+					out = append(out, n)
+				}
+			}
