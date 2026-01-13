@@ -52,8 +52,7 @@ func main() {
 
 // discoverURL пытается получить URL из аргументов/окружения (как обычно делают автотесты).
 func discoverURL() string {
-	// 1) Аргументы: поддержим самые частые варианты и при этом НЕ падаем на чужих флагах.
-	// Примеры: -url http://...  --url=http://...  -addr http://...
+	// Аргументы: поддержим самые частые варианты и при этом НЕ падаем на чужих флагах.
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -68,7 +67,7 @@ func discoverURL() string {
 		}
 	}
 
-	// 2) Окружение: пробуем несколько типичных имён (автотесты часто так передают адрес)
+	// Окружение: пробуем несколько типичных имён (автотесты часто так передают адрес)
 	envKeys := []string{
 		"SRVMONITOR_URL",
 		"SRVMONITOR_ADDR",
@@ -85,14 +84,17 @@ func discoverURL() string {
 		}
 	}
 
-	// 3) Фоллбек: без порта (если тест слушает 80) и со стандартным путём.
+	// Фоллбек: без порта (если тест слушает 80) и со стандартным путём.
 	// Если тест на другом порту — он обязан передать URL через env/args (выше).
 	return "http://srv.msk01.gigacorp.local"
 }
 
 func fetch(client *http.Client, base string) ([]byte, bool) {
 	// Пробуем 2 варианта пути: "/" и "/stats" (часто используют один из них)
-	candidates := []string{base, strings.TrimRight(base, "/") + "/stats"}
+	candidates := []string{
+		strings.TrimRight(base, "/") + "/",
+		strings.TrimRight(base, "/") + "/stats",
+	}
 
 	for _, url := range candidates {
 		resp, err := client.Get(url)
@@ -104,7 +106,6 @@ func fetch(client *http.Client, base string) ([]byte, bool) {
 		if err != nil {
 			continue
 		}
-		// даже если статус не 200 — пусть попытка считается неудачной
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			continue
 		}
@@ -115,28 +116,28 @@ func fetch(client *http.Client, base string) ([]byte, bool) {
 
 func buildAlerts(body []byte) []string {
 	// Ждём, что сервер отдаёт JSON.
-	// Делаем максимально “терпеливый” парсер, чтобы подхватить разные имена полей.
+	// Делаем максимально “терпеливый” парсер.
 	var v any
 	if err := json.Unmarshal(body, &v); err != nil {
 		return nil
 	}
 
 	// Ищем значения по ключам (рекурсивно)
-	disk := findNumbersByKey(v, []string{"disk", "free", "space", "mb"})
-	net := findNumbersByKey(v, []string{"network", "bandwidth", "mbit"})
-	mem := findNumbersByKey(v, []string{"memory", "usage", "percent"})
+	disk := findNumbersByKey(v, []string{"disk"})
+	net := findNumbersByKey(v, []string{"network"})
+	mem := findNumbersByKey(v, []string{"memory"})
 	load := findNumbersByKey(v, []string{"load"})
 
 	lines := make([]string, 0, 16)
 
-	// ВАЖНО: порядок сообщений как в ожидаемом выводе: network -> disk -> load -> memory
+	// Порядок сообщений: network -> disk -> load -> memory
 	for _, n := range net {
-		if int(n) < netMinMbit && int(n) > 0 {
+		if int(n) > 0 && int(n) < netMinMbit {
 			lines = append(lines, fmt.Sprintf("Network bandwidth usage high: %d Mbit/s available", int(n)))
 		}
 	}
 	for _, d := range disk {
-		if int(d) < diskMinMB && int(d) > 0 {
+		if int(d) > 0 && int(d) < diskMinMB {
 			lines = append(lines, fmt.Sprintf("Free disk space is too low: %d Mb left", int(d)))
 		}
 	}
@@ -154,13 +155,13 @@ func buildAlerts(body []byte) []string {
 	return lines
 }
 
-// findNumbersByKey рекурсивно обходит JSON-объект и собирает числа из полей,
-// чьи ключи содержат ВСЕ указанные подстроки (без учёта регистра).
-func findNumbersByKey(v any, mustContain []string) []float64 {
+// findNumbersByKey рекурсивно обходит JSON и собирает числа из полей,
+// ключ которых содержит любую из подстрок (без учёта регистра).
+func findNumbersByKey(v any, keyHints []string) []float64 {
 	out := []float64{}
-	want := make([]string, 0, len(mustContain))
-	for _, s := range mustContain {
-		want = append(want, strings.ToLower(s))
+	hints := make([]string, 0, len(keyHints))
+	for _, s := range keyHints {
+		hints = append(hints, strings.ToLower(s))
 	}
 
 	var walk func(any, string)
@@ -175,14 +176,28 @@ func findNumbersByKey(v any, mustContain []string) []float64 {
 				walk(vv, key)
 			}
 		case float64:
-			if keyMatches(key, want) {
+			if keyHasAnyHint(key, hints) {
 				out = append(out, t)
 			}
 		case string:
-			// иногда числа приходят строкой
-			if keyMatches(key, want) {
+			if keyHasAnyHint(key, hints) {
 				if n, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
 					out = append(out, n)
 				}
 			}
+		}
+	}
+
+	walk(v, "")
+	return out
+}
+
+func keyHasAnyHint(key string, hints []string) bool {
+	k := strings.ToLower(key)
+	for _, h := range hints {
+		if strings.Contains(k, h) {
+			return true
+		}
+	}
+	return false
 }
