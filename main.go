@@ -16,7 +16,7 @@ import (
 const (
 	diskMinMB     = 40000
 	netMinMbit    = 300
-	memMaxPercent = 90
+	memMaxPercent = 80
 	loadMax       = 40
 )
 
@@ -143,7 +143,7 @@ func buildAlerts(body []byte) []string {
 	lines := make([]string, 0, 4)
 
 	// Порядок как ожидают тесты: load -> network -> memory -> disk
-	if load > loadMax {
+	if load >= loadMax {
 		lines = append(lines, fmt.Sprintf("Load Average is too high: %d", load))
 	}
 
